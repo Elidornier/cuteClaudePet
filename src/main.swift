@@ -168,7 +168,7 @@ func runHook() -> Int32 {
     let host = ProcessInfo.processInfo.environment["CLAUDE_CODE_HOST_SESSION_ID"]
     let mode = obj["permission_mode"] as? String ?? ""
     // you told Claude to go ahead without asking: approval alerts would just be noise
-    let quietApprovals = mode == "bypassPermissions" && !petPref("alertInBypass")
+    let quietApprovals = mode == "bypassPermissions"
     let slot = slotURL(session: session, agent: agent)
 
     logLine("\(event) tool=\(tool ?? "-") ntype=\(ntype.isEmpty ? "-" : ntype) agent=\(agent ?? "-") session=\(session.prefix(8)) host=\(host ?? "-") mode=\(mode.isEmpty ? "-" : mode) app=\(app ?? "-")")
@@ -766,10 +766,6 @@ final class Controller: NSObject, NSApplicationDelegate {
         let every = wanderEvery
         return every <= 0 ? Double.random(in: 3...10) : every * Double.random(in: 0.8...1.2)
     }
-    var skipInBypass: Bool {
-        get { !defaults.bool(forKey: "alertInBypass") }
-        set { defaults.set(!newValue, forKey: "alertInBypass") }
-    }
     var notifyDone: Bool {
         get { !defaults.bool(forKey: "doneOff") }
         set { defaults.set(!newValue, forKey: "doneOff") }
@@ -1006,7 +1002,6 @@ final class Controller: NSObject, NSApplicationDelegate {
         add("静音提示音", #selector(toggleMute), on: muted)
         add("对话做完了也提醒我", #selector(toggleDone), on: notifyDone)
         add("正在看的对话就不提醒", #selector(toggleSkipViewed), on: skipViewed)
-        add("bypass 模式下不提醒批准", #selector(toggleSkipInBypass), on: skipInBypass)
         add("平时躲起来，只在需要你时出现", #selector(toggleHide), on: hideWhenIdle)
         let walk = NSMenuItem(title: "溜达频率", action: nil, keyEquivalent: "")
         let walkMenu = NSMenu()
@@ -1036,7 +1031,6 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc func toggleHide() { hideWhenIdle.toggle() }
     @objc func toggleDone() { notifyDone.toggle(); poll() }
     @objc func toggleSkipViewed() { skipViewed.toggle(); poll() }
-    @objc func toggleSkipInBypass() { skipInBypass.toggle() }
     @objc func setWanderEvery(_ sender: NSMenuItem) {
         guard let secs = sender.representedObject as? Double else { return }
         wanderEvery = secs
@@ -1139,7 +1133,6 @@ if args.count > 1 {
         print("focused chat:  \(f.focused ?? "-")")
         print("frontmost app: \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-")")
         print("idle seconds:  \(Int(userIdleSeconds()))")
-        print("bypass alerts: \(petPref("alertInBypass") ? "on" : "off (quiet in bypass mode)")")
         print("muted:         \(petPref("muted"))")
         print("pending:       \(allPending().map { "\($0.1.kind)@\($0.1.host ?? "-")" })")
         exit(0)
