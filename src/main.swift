@@ -324,6 +324,8 @@ final class PetView: NSView {
     var bubble: [Line] = []
     var bubbleStart: Double = 0
     var clearsBackground = true
+    var walkDir = 0                 // -1 left, 0 standing, 1 right
+    var mouseIsDown = false
 
     var blinkUntil: Double = 0
     var nextBlink: Double = 2.5
@@ -349,6 +351,7 @@ final class PetView: NSView {
     // Interaction: click = go approve / pet me, drag = move, right-click = menu.
     override func mouseDown(with e: NSEvent) {
         if e.modifierFlags.contains(.control) { rightMouseDown(with: e); return }
+        mouseIsDown = true
         downScreen = NSEvent.mouseLocation
         downOrigin = window?.frame.origin ?? .zero
         dragged = false
@@ -363,6 +366,7 @@ final class PetView: NSView {
     }
 
     override func mouseUp(with e: NSEvent) {
+        mouseIsDown = false
         if e.modifierFlags.contains(.control) { return }
         if dragged { controller?.savePosition() } else { controller?.petClicked() }
     }
@@ -427,9 +431,14 @@ final class PetView: NSView {
         var legA: CGFloat = 0, legB: CGFloat = 0
         switch mood {
         case .idle:
-            bodyLift = sin(t * 2.2) > 0.3 ? 2 : 0                       // breathing
-            if t.truncatingRemainder(dividingBy: 6.5) < 1.0 {             // a little shuffle now and then
-                let s = sin(t * 14) > 0; legA = s ? 3 : 0; legB = s ? 0 : 3
+            if walkDir != 0 {                                             // scuttling sideways
+                let s = sin(t * 18) > 0; legA = s ? 3 : 0; legB = s ? 0 : 3
+                bodyLift = s ? 1 : 0
+            } else {
+                bodyLift = sin(t * 2.2) > 0.3 ? 2 : 0                   // breathing
+                if t.truncatingRemainder(dividingBy: 6.5) < 1.0 {         // a little shuffle now and then
+                    let s = sin(t * 14) > 0; legA = s ? 3 : 0; legB = s ? 0 : 3
+                }
             }
         case .sleepy:
             bodyLift = sin(t * 1.3) > 0 ? 0 : -2
@@ -462,6 +471,7 @@ final class PetView: NSView {
         let eyeMood: Mood = mood == .done ? (t - doneKick < 2 ? .happy : .idle) : mood
         let eyeY = legTop + 2 * rowH + by
         for (i, ex) in [-4 * u, 3 * u].enumerated() {
+            let ex = ex + (eyeMood == .idle ? CGFloat(walkDir) * 1.5 : 0)   // look where you're going
             let r = NSRect(x: ex, y: eyeY, width: u, height: rowH)
             switch eyeMood {
             case .idle, .done:
@@ -650,6 +660,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     let focus = FocusWatcher()
     var viewing: String?            // desktop chat you're looking at right now (local_…)
     var seen = Set<String>()        // approval requests you already had on screen
+    var home: NSPoint = .zero       // where you put it; it wanders around here
+    var walkTarget: CGFloat?
+    var nextWanderAt: Double = 4
     var prevCount = 0
     var prevDone = 0
     var lastRemind: Double = 0
@@ -673,6 +686,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         get { !defaults.bool(forKey: "remindViewedToo") }
         set { defaults.set(!newValue, forKey: "remindViewedToo") }
     }
+    var wanderEnabled: Bool {
+        get { !defaults.bool(forKey: "noWander") }
+        set { defaults.set(!newValue, forKey: "noWander") }
+    }
     var notifyDone: Bool {
         get { !defaults.bool(forKey: "doneOff") }
         set { defaults.set(!newValue, forKey: "doneOff") }
@@ -691,7 +708,8 @@ final class Controller: NSObject, NSApplicationDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         view.controller = self
         panel.contentView = view
-        panel.setFrameOrigin(initialOrigin())
+        home = initialOrigin()
+        panel.setFrameOrigin(home)
         poll()
         panel.orderFrontRegardless()
 
@@ -716,6 +734,50 @@ final class Controller: NSObject, NSApplicationDelegate {
         defaults.set(Double(panel.frame.origin.x), forKey: "x")
         defaults.set(Double(panel.frame.origin.y), forKey: "y")
         lastInteraction = now()
+        home = panel.frame.origin; walkTarget = nil; nextWanderAt = lastTick + 6
+    }
+
+    /// Idle crab: scuttle sideways around its home corner, pause, repeat. Freezes while you hover over it.
+    func wander(t: Double, dt: Double, mood: Mood) {
+        let f = panel.frame
+        let petRect = NSRect(x: f.minX + 66, y: f.minY + 4, width: 108, height: 100)
+        let free = wanderEnabled && mood == .idle && panel.isVisible && !view.mouseIsDown
+        guard free, !petRect.contains(NSEvent.mouseLocation) else {
+            view.walkDir = 0
+            if !free { walkTarget = nil; nextWanderAt = max(nextWanderAt, t + 4) }
+            return
+        }
+        guard let target = walkTarget else {
+            if t > nextWanderAt {
+                walkTarget = pickWanderTarget(from: f.minX)
+                if walkTarget == nil { nextWanderAt = t + 8 }
+            }
+            return
+        }
+        let dx = target - f.minX
+        let step = CGFloat(45 * dt)
+        if abs(dx) <= step {
+            panel.setFrameOrigin(NSPoint(x: target, y: f.minY))
+            walkTarget = nil; view.walkDir = 0
+            nextWanderAt = t + Double.random(in: 3...10)
+        } else {
+            let x = ((f.minX + (dx > 0 ? step : -step)) * 2).rounded() / 2
+            panel.setFrameOrigin(NSPoint(x: x, y: f.minY))
+            view.walkDir = dx > 0 ? 1 : -1
+        }
+    }
+
+    /// A spot within ~200pt of home that keeps the whole window (and its speech bubble) on screen.
+    func pickWanderTarget(from x: CGFloat) -> CGFloat? {
+        let anchor = NSPoint(x: home.x + view.frame.width / 2, y: home.y + 40)
+        guard let vf = (NSScreen.screens.first { $0.frame.contains(anchor) } ?? NSScreen.main)?.visibleFrame else { return nil }
+        let lo = max(vf.minX, home.x - 200), hi = min(vf.maxX - view.frame.width, home.x + 200)
+        guard hi - lo > 60 else { return nil }
+        for _ in 0..<6 {
+            let c = CGFloat.random(in: lo...hi).rounded()
+            if abs(c - x) > 50 { return c }
+        }
+        return nil
     }
 
     func poll() {
@@ -794,6 +856,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         view.bubble = bubbleLines(mood: mood, pendings: pendings, dones: dones, pettedLine: pettedLine)
         view.t = t
         view.step(dt)
+        wander(t: t, dt: min(dt, 0.1), mood: mood)
 
         let show = !(hideWhenIdle && (mood == .idle || mood == .sleepy))
         if show != panel.isVisible {
@@ -856,6 +919,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         add("对话做完了也提醒我", #selector(toggleDone), on: notifyDone)
         add("正在看的对话就不提醒", #selector(toggleSkipViewed), on: skipViewed)
         add("平时躲起来，只在需要你时出现", #selector(toggleHide), on: hideWhenIdle)
+        add("没事时在角落溜达", #selector(toggleWander), on: wanderEnabled)
         add("回到屏幕右下角", #selector(resetPosition))
         m.addItem(.separator())
         add("让小 Claude先下班（有请求时会再回来）", #selector(quit))
@@ -871,9 +935,14 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc func toggleHide() { hideWhenIdle.toggle() }
     @objc func toggleDone() { notifyDone.toggle(); poll() }
     @objc func toggleSkipViewed() { skipViewed.toggle(); poll() }
+    @objc func toggleWander() {
+        wanderEnabled.toggle()
+        if !wanderEnabled { walkTarget = nil; view.walkDir = 0; panel.setFrameOrigin(home) }
+    }
     @objc func demoDone() { writeDemoDone(); poll() }
     @objc func resetPosition() {
-        panel.setFrameOrigin(defaultOrigin())
+        home = defaultOrigin(); walkTarget = nil
+        panel.setFrameOrigin(home)
         defaults.removeObject(forKey: "x"); defaults.removeObject(forKey: "y")
     }
     @objc func quit() { NSApp.terminate(nil) }
