@@ -662,7 +662,8 @@ final class Controller: NSObject, NSApplicationDelegate {
     var seen = Set<String>()        // approval requests you already had on screen
     var home: NSPoint = .zero       // where you put it; it wanders around here
     var walkTarget: CGFloat?
-    var nextWanderAt: Double = 4
+    var nextWanderAt: Double = 600
+    var strollLegsLeft = 0          // a stroll is a few short walks in a row
     var prevCount = 0
     var prevDone = 0
     var lastRemind: Double = 0
@@ -686,9 +687,20 @@ final class Controller: NSObject, NSApplicationDelegate {
         get { !defaults.bool(forKey: "remindViewedToo") }
         set { defaults.set(!newValue, forKey: "remindViewedToo") }
     }
-    var wanderEnabled: Bool {
-        get { !defaults.bool(forKey: "noWander") }
-        set { defaults.set(!newValue, forKey: "noWander") }
+    /// Seconds between strolls: 0 = keep strolling, -1 = never. Defaults to every 10 minutes.
+    var wanderEvery: Double {
+        get {
+            if defaults.object(forKey: "wanderEvery") == nil { return defaults.bool(forKey: "noWander") ? -1 : 600 }
+            return defaults.double(forKey: "wanderEvery")
+        }
+        set { defaults.set(newValue, forKey: "wanderEvery") }
+    }
+    var wanderEnabled: Bool { wanderEvery >= 0 }
+
+    /// How long to rest before the next stroll (±20% so it doesn't feel mechanical).
+    func restInterval() -> Double {
+        let every = wanderEvery
+        return every <= 0 ? Double.random(in: 3...10) : every * Double.random(in: 0.8...1.2)
     }
     var notifyDone: Bool {
         get { !defaults.bool(forKey: "doneOff") }
@@ -710,6 +722,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         panel.contentView = view
         home = initialOrigin()
         panel.setFrameOrigin(home)
+        nextWanderAt = restInterval()
         poll()
         panel.orderFrontRegardless()
 
@@ -734,7 +747,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         defaults.set(Double(panel.frame.origin.x), forKey: "x")
         defaults.set(Double(panel.frame.origin.y), forKey: "y")
         lastInteraction = now()
-        home = panel.frame.origin; walkTarget = nil; nextWanderAt = lastTick + 6
+        home = panel.frame.origin; walkTarget = nil; strollLegsLeft = 0; nextWanderAt = lastTick + restInterval()
     }
 
     /// Idle crab: scuttle sideways around its home corner, pause, repeat. Freezes while you hover over it.
@@ -749,8 +762,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
         guard let target = walkTarget else {
             if t > nextWanderAt {
+                if strollLegsLeft <= 0 { strollLegsLeft = wanderEvery > 0 ? Int.random(in: 2...3) : 1 }
                 walkTarget = pickWanderTarget(from: f.minX)
-                if walkTarget == nil { nextWanderAt = t + 8 }
+                if walkTarget == nil { strollLegsLeft = 0; nextWanderAt = t + max(8, restInterval()) }
             }
             return
         }
@@ -759,7 +773,8 @@ final class Controller: NSObject, NSApplicationDelegate {
         if abs(dx) <= step {
             panel.setFrameOrigin(NSPoint(x: target, y: f.minY))
             walkTarget = nil; view.walkDir = 0
-            nextWanderAt = t + Double.random(in: 3...10)
+            strollLegsLeft -= 1
+            nextWanderAt = t + (strollLegsLeft > 0 ? Double.random(in: 2...4) : restInterval())
         } else {
             let x = ((f.minX + (dx > 0 ? step : -step)) * 2).rounded() / 2
             panel.setFrameOrigin(NSPoint(x: x, y: f.minY))
@@ -919,7 +934,19 @@ final class Controller: NSObject, NSApplicationDelegate {
         add("对话做完了也提醒我", #selector(toggleDone), on: notifyDone)
         add("正在看的对话就不提醒", #selector(toggleSkipViewed), on: skipViewed)
         add("平时躲起来，只在需要你时出现", #selector(toggleHide), on: hideWhenIdle)
-        add("没事时在角落溜达", #selector(toggleWander), on: wanderEnabled)
+        let walk = NSMenuItem(title: "溜达频率", action: nil, keyEquivalent: "")
+        let walkMenu = NSMenu()
+        walkMenu.autoenablesItems = false
+        let choices: [(String, Double)] = [("一直溜达", 0), ("每 1 分钟", 60), ("每 5 分钟", 300), ("每 10 分钟", 600), ("不溜达", -1)]
+        for (title, secs) in choices {
+            let i = NSMenuItem(title: title, action: #selector(setWanderEvery(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = secs
+            i.state = wanderEvery == secs ? .on : .off
+            walkMenu.addItem(i)
+        }
+        walk.submenu = walkMenu
+        m.addItem(walk)
         add("回到屏幕右下角", #selector(resetPosition))
         m.addItem(.separator())
         add("让小 Claude先下班（有请求时会再回来）", #selector(quit))
@@ -935,9 +962,12 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc func toggleHide() { hideWhenIdle.toggle() }
     @objc func toggleDone() { notifyDone.toggle(); poll() }
     @objc func toggleSkipViewed() { skipViewed.toggle(); poll() }
-    @objc func toggleWander() {
-        wanderEnabled.toggle()
-        if !wanderEnabled { walkTarget = nil; view.walkDir = 0; panel.setFrameOrigin(home) }
+    @objc func setWanderEvery(_ sender: NSMenuItem) {
+        guard let secs = sender.representedObject as? Double else { return }
+        wanderEvery = secs
+        walkTarget = nil; view.walkDir = 0; strollLegsLeft = 0
+        if secs < 0 { panel.setFrameOrigin(home) }
+        nextWanderAt = lastTick + (secs == 0 ? 0.5 : restInterval())
     }
     @objc func demoDone() { writeDemoDone(); poll() }
     @objc func resetPosition() {
