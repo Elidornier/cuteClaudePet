@@ -18,13 +18,14 @@
 | 你批准了 | `^ ^` 开心蹦跶、冒小爱心 |
 | 一个对话做完了 | 欢呼一下、换个提示音，气泡「✅ Claude 做完啦！」，之后每 5 秒小跳一下等你 |
 | 好几个对话在等 | 合并成「有 N 件事等你批准！」/「有 N 个对话做完啦！」 |
+| 你正开着那个对话 | 不打扰：在你眼前做完的不提醒；等批准的也先不响，你离开那个对话时才安静地提醒 |
 | 5 分钟没动静 | 眯眼睡觉冒 z |
 
 **操作**
 
 - **单击**：有提醒时直接打开那个对话（Claude 桌面版用 `claude://code/continue?session=…` 跳到具体对话；终端里的 Claude Code 会把终端叫到前面）。多个对话做完时，每点一下跳一个。没提醒时点它会撒娇。
 - **拖动**：放到哪都行，会记住位置。
-- **右键**：试一下提醒 · 清除当前提醒 · 对话做完了也提醒我 · 静音 · 平时躲起来只在需要你时出现 · 回到右下角 · 下班。
+- **右键**：试一下提醒 · 清除当前提醒 · 对话做完了也提醒我 · 正在看的对话就不提醒 · 静音 · 平时躲起来只在需要你时出现 · 回到右下角 · 下班。
 
 ## 安装
 
@@ -67,6 +68,7 @@ cd ~/.claude && jq -s '.[0] as $s | .[1].hooks as $h | $s | .hooks = (reduce ($h
 - `hooks.json` 给 Claude Code 注册了一组 **async 钩子**（不会拖慢 Claude）：`PermissionRequest`、`Notification`、`PreToolUse`（AskUserQuestion / ExitPlanMode）记录「需要你」；`PostToolUse`、`UserPromptSubmit`、`Stop` 等清除提醒；`Stop` 同时留下「做完啦」。
 - 钩子调用 `ApprovalPet hook`，它把每个等待中的对话写成 `pending/` 里的一个小 JSON 文件（会话 ID、工具名、项目名、桌面对话 ID）。
 - 桌面宠物 `ApprovalPet.app`（无 Dock 图标的浮动小窗口）每 0.4 秒看一眼 `pending/`，决定心情和气泡。
+- 「你正在看哪个对话」：Claude 桌面版在 `~/Library/Logs/Claude/main.log` 里记录 `setFocusedSession: sessionId=local_…`，小螃蟹读这行，再加上 Claude 是否在最前面、你最近 2 分钟有没有动键盘鼠标来判断。这是 App 的内部日志格式，以后 App 更新可能会变；变了的话只是退回到「照常提醒」。
 - 所有东西都在本机，不联网。`events.log` 记录最近收到的钩子事件，方便排查。
 
 ```text
@@ -75,6 +77,7 @@ ApprovalPet hook         钩子入口（从 stdin 读钩子 JSON）
 ApprovalPet demo         假装有个批准请求（8 秒后消失）
 ApprovalPet demo-done    假装有个对话做完了
 ApprovalPet clear        清除所有提醒
+ApprovalPet status       看看小螃蟹认为你正在看哪个对话
 ApprovalPet snapshot F   把各种状态画成一张 PNG
 ```
 

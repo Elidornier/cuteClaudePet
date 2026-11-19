@@ -5,6 +5,7 @@
 //   ApprovalPet demo          fake an approval request for a few seconds
 //   ApprovalPet demo-done     fake a "chat finished" reminder for a few seconds
 //   ApprovalPet clear         forget every pending request
+//   ApprovalPet status        show which chat the pet thinks you're looking at
 //   ApprovalPet snapshot F    render a preview strip of every mood into PNG file F
 
 import AppKit
@@ -32,6 +33,10 @@ struct Pending: Codable {
     var project: String?
     var time: Double
     var host: String? = nil   // Claude desktop chat id (local_…), used to jump straight to that chat
+}
+
+extension Pending {
+    var key: String { "\(session)|\(agent ?? "-")|\(kind)|\(time)" }
 }
 
 func now() -> Double { Date().timeIntervalSince1970 }
@@ -594,6 +599,43 @@ final class PetView: NSView {
     }
 }
 
+// MARK: - Which chat are you looking at?
+
+/// The Claude desktop app logs `LocalSessions.setFocusedSession: sessionId=…` whenever you switch chats.
+/// We follow the end of that log to know which chat is on screen.
+final class FocusWatcher {
+    let url = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Claude/main.log")
+    private(set) var focused: String?
+    private var offset: UInt64 = 0
+    private var inode: UInt64?
+    private let marker = "setFocusedSession: sessionId="
+
+    func refresh() {
+        guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+              let size = (attrs[.size] as? NSNumber)?.uint64Value else { return }
+        let ino = (attrs[.systemFileNumber] as? NSNumber)?.uint64Value
+        if ino != inode || size < offset {               // first look, or the log was rotated
+            inode = ino
+            offset = size > 1_048_576 ? size - 1_048_576 : 0
+        }
+        guard size > offset, let h = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? h.close() }
+        h.seek(toFileOffset: offset)
+        let data = h.readData(ofLength: Int(size - offset))
+        guard let lastNL = data.lastIndex(of: 0x0A) else { return }   // only read whole lines
+        offset += UInt64(lastNL - data.startIndex + 1)
+        let text = String(decoding: data[data.startIndex...lastNL], as: UTF8.self)
+        if let r = text.range(of: marker, options: .backwards) {
+            let id = text[r.upperBound...].prefix { !$0.isWhitespace && $0 != "," }
+            focused = id == "null" ? nil : String(id)
+        }
+    }
+}
+
+func userIdleSeconds() -> Double {
+    CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+}
+
 // MARK: - App controller
 
 final class Controller: NSObject, NSApplicationDelegate {
@@ -605,6 +647,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     var lastPoll: Double = 0
     var pendings: [Pending] = []
     var dones: [Pending] = []
+    let focus = FocusWatcher()
+    var viewing: String?            // desktop chat you're looking at right now (local_…)
+    var seen = Set<String>()        // approval requests you already had on screen
     var prevCount = 0
     var prevDone = 0
     var lastRemind: Double = 0
@@ -623,6 +668,10 @@ final class Controller: NSObject, NSApplicationDelegate {
     var hideWhenIdle: Bool {
         get { defaults.bool(forKey: "hideWhenIdle") }
         set { defaults.set(newValue, forKey: "hideWhenIdle") }
+    }
+    var skipViewed: Bool {
+        get { !defaults.bool(forKey: "remindViewedToo") }
+        set { defaults.set(!newValue, forKey: "remindViewedToo") }
     }
     var notifyDone: Bool {
         get { !defaults.bool(forKey: "doneOff") }
@@ -672,6 +721,13 @@ final class Controller: NSObject, NSApplicationDelegate {
     func poll() {
         let wall = now()
         var list: [Pending] = []
+        focus.refresh()
+        viewing = nil
+        if skipViewed, NSWorkspace.shared.frontmostApplication?.bundleIdentifier == claudeDesktopBundleID,
+           userIdleSeconds() < 120 {
+            viewing = focus.focused
+        }
+        if seen.count > 500 { seen.removeAll() }
         for (url, p) in allPending() {
             let age = wall - p.time
             var stale = age > 4 * 3600 || (p.session.hasPrefix("demo") && age > 8)
@@ -681,7 +737,13 @@ final class Controller: NSObject, NSApplicationDelegate {
                NSRunningApplication.runningApplications(withBundleIdentifier: app).isEmpty {
                 stale = true   // the app hosting that session is gone
             }
-            if stale { try? fm.removeItem(at: url) } else { list.append(p) }
+            if stale { try? fm.removeItem(at: url); continue }
+            if let v = viewing, p.host == v {
+                // you're looking at this chat: it finished in front of you, or its prompt is on your screen
+                if p.kind == "done" { try? fm.removeItem(at: url) } else { seen.insert(p.key) }
+                continue
+            }
+            list.append(p)
         }
         let sorted = list.sorted { $0.time > $1.time }
         pendings = sorted.filter { $0.kind != "done" }
@@ -702,7 +764,8 @@ final class Controller: NSObject, NSApplicationDelegate {
         if count > prevCount {
             view.alertKick = t; view.bubbleStart = t
             lastRemind = wall; reminds = 0; lastInteraction = wall
-            if !muted { NSSound(named: "Glass")?.play() }
+            // no sound for a request you already saw in its chat (it shows up quietly when you leave)
+            if !muted && pendings.contains(where: { !seen.contains($0.key) }) { NSSound(named: "Glass")?.play() }
         } else if count == 0 && prevCount > 0 {
             happyUntil = t + 2.2
         }
@@ -791,6 +854,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         m.addItem(.separator())
         add("静音提示音", #selector(toggleMute), on: muted)
         add("对话做完了也提醒我", #selector(toggleDone), on: notifyDone)
+        add("正在看的对话就不提醒", #selector(toggleSkipViewed), on: skipViewed)
         add("平时躲起来，只在需要你时出现", #selector(toggleHide), on: hideWhenIdle)
         add("回到屏幕右下角", #selector(resetPosition))
         m.addItem(.separator())
@@ -806,6 +870,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc func toggleMute() { muted.toggle() }
     @objc func toggleHide() { hideWhenIdle.toggle() }
     @objc func toggleDone() { notifyDone.toggle(); poll() }
+    @objc func toggleSkipViewed() { skipViewed.toggle(); poll() }
     @objc func demoDone() { writeDemoDone(); poll() }
     @objc func resetPosition() {
         panel.setFrameOrigin(defaultOrigin())
@@ -883,6 +948,13 @@ if args.count > 1 {
         writeDemoDone(); ensurePetRunning(); exit(0)
     case "clear":
         clearAllPending(); exit(0)
+    case "status":
+        let f = FocusWatcher(); f.refresh()
+        print("focused chat:  \(f.focused ?? "-")")
+        print("frontmost app: \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-")")
+        print("idle seconds:  \(Int(userIdleSeconds()))")
+        print("pending:       \(allPending().map { "\($0.1.kind)@\($0.1.host ?? "-")" })")
+        exit(0)
     case "snapshot":
         renderSnapshot(to: args.count > 2 ? args[2] : "pet-preview.png"); exit(0)
     default:
