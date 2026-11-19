@@ -5,6 +5,7 @@
 //   ApprovalPet demo          fake an approval request for a few seconds
 //   ApprovalPet demo-done     fake a "chat finished" reminder for a few seconds
 //   ApprovalPet demo-work     fake "Claude is working" for a few seconds
+//   ApprovalPet trick [NAME]  do a trick now (dance, scratch, coffee, wave, look, stretch, juggle, shades)
 //   ApprovalPet clear         forget every pending request
 //   ApprovalPet status        show which chat the pet thinks you're looking at
 //   ApprovalPet snapshot F    render a preview strip of every mood into PNG file F
@@ -266,6 +267,23 @@ func roundedFont(_ size: CGFloat, _ w: NSFont.Weight) -> NSFont {
 
 enum Mood { case idle, sleepy, alert, done, happy, petted, working }
 
+/// Little things the crab does on its own when nothing's going on.
+enum Trick: String, CaseIterable {
+    case dance, scratch, coffee, wave, look, stretch, juggle, shades
+    var duration: Double {
+        switch self {
+        case .dance: return 4.5
+        case .scratch: return 3.5
+        case .coffee: return 5.0
+        case .wave: return 2.6
+        case .look: return 3.4
+        case .stretch: return 3.0
+        case .juggle: return 4.5
+        case .shades: return 4.0
+        }
+    }
+}
+
 typealias Line = (text: String, font: NSFont, color: NSColor)
 
 func wantPhrase(_ tool: String?) -> String? {
@@ -355,6 +373,8 @@ final class PetView: NSView {
     var clearsBackground = true
     var walkDir = 0                 // -1 left, 0 standing, 1 right
     var mouseIsDown = false
+    var trick: Trick?
+    var trickStart: Double = 0
 
     var blinkUntil: Double = 0
     var nextBlink: Double = 2.5
@@ -486,6 +506,50 @@ final class PetView: NSView {
             armL = s ? -13 : -9; armR = s ? -9 : -13
         }
 
+        // idle tricks override the pose
+        var sway: CGFloat = 0, lookDX: CGFloat = 0, lookDY: CGFloat = 0
+        var trickEyes: Mood? = nil
+        var trickMouth = 0                                   // 1 small "o", 2 big yawn
+        let tr: Trick? = mood == .idle ? trick : nil
+        let tt = t - trickStart
+        if let tr {
+            legA = 0; legB = 0
+            switch tr {
+            case .dance:
+                let s = sin(tt * 2.5 * .pi)
+                sway = s > 0 ? 4 : -4
+                bodyLift = abs(s) > 0.7 ? 2 : 0
+                armL = s > 0 ? 12 : 2; armR = s > 0 ? 2 : 12
+                legA = s > 0 ? 3 : 0; legB = s > 0 ? 0 : 3
+                trickEyes = .happy
+            case .scratch:
+                armR = -16 + (sin(tt * 30) > 0 ? 2 : 0)      // claw round the back, scratch scratch
+                sway = 2; legB = 2
+                trickEyes = .sleepy                           // bliss
+            case .coffee:
+                let k = max(0, min(1, min(tt / 0.4, (tr.duration - tt) / 0.4)))
+                armR = (14 * CGFloat(k)).rounded()
+                let sipping = (tt > 1.0 && tt < 2.0) || (tt > 2.8 && tt < 3.8)
+                trickEyes = sipping ? .sleepy : .idle
+            case .wave:
+                armR = sin(tt * 18) > 0 ? 16 : 10
+                trickMouth = 1
+            case .look:
+                lookDX = tt < 0.9 ? -2.5 : (tt < 1.3 ? 0 : (tt < 2.3 ? 2.5 : 0))
+            case .stretch:
+                let k = CGFloat(max(0, min(1, min(tt / 0.6, (tr.duration - tt) / 0.6))))
+                armL = (16 * k).rounded(); armR = armL; bodyLift = (3 * k).rounded()
+                trickEyes = .sleepy; trickMouth = k > 0.5 ? 2 : 0
+            case .juggle:
+                let s = sin(tt * 2 * .pi / 1.1 * 3) > 0
+                armL = s ? 6 : 0; armR = s ? 0 : 6
+                lookDY = 1.5                                  // eyes on the balls
+            case .shades:
+                if tt > 0.6 && tt < tr.duration - 0.6 { bodyLift = sin(tt * 8) > 0 ? 2 : 0 }   // bobbing to the beat
+            }
+        }
+        ctx.translateBy(x: sway, y: 0)
+
         let legTop = rowH
         let by = bodyLift
         petColor.setFill()
@@ -504,10 +568,10 @@ final class PetView: NSView {
             NSRect(x: -26, y: 28 + by, width: 52, height: 7).fill()
         }
         // eyes: row 1, columns 5 and 12
-        let eyeMood: Mood = mood == .done ? (t - doneKick < 2 ? .happy : .idle) : mood
-        let eyeY = legTop + 2 * rowH + by
+        let eyeMood: Mood = trickEyes ?? (mood == .done ? (t - doneKick < 2 ? .happy : .idle) : mood)
+        let eyeY = legTop + 2 * rowH + by + lookDY
         for (i, ex) in [-4 * u, 3 * u].enumerated() {
-            let ex = ex + (eyeMood == .idle ? CGFloat(walkDir) * 1.5 : 0)   // look where you're going
+            let ex = ex + (eyeMood == .idle ? CGFloat(walkDir) * 1.5 + lookDX : 0)   // look where you're going
             let r = NSRect(x: ex, y: eyeY, width: u, height: rowH)
             switch eyeMood {
             case .idle, .done:
@@ -540,6 +604,7 @@ final class PetView: NSView {
             mouthRed.setFill(); NSRect(x: -3 - o / 2, y: eyeY + 1, width: 6 + o, height: 4 + o).fill()
         }
         if mood == .working { drawLaptop() }
+        if let tr { drawTrickProps(tr, tt: tt, by: by, eyeY: eyeY, mouth: trickMouth) }
     }
 
     /// A tiny laptop in front of the crab; we see the back of its lid.
@@ -551,6 +616,71 @@ final class PetView: NSView {
         NSRect(x: -4.5, y: 15.5, width: 9, height: 3).fill()
         rgb(0xC7CCD3).setFill(); NSRect(x: -34, y: 2, width: 68, height: 5).fill()       // base
         rgb(0x9AA1AB).setFill(); NSRect(x: -34, y: 2, width: 68, height: 1.5).fill()
+    }
+
+    /// Props and little effects for idle tricks (local coordinates: y up, origin under its feet).
+    func drawTrickProps(_ tr: Trick, tt: Double, by: CGFloat, eyeY: CGFloat, mouth: Int) {
+        if mouth == 1 { mouthRed.setFill(); NSRect(x: -2.5, y: eyeY + 1, width: 5, height: 3).fill() }
+        if mouth == 2 { mouthRed.setFill(); NSRect(x: -4, y: eyeY - 1, width: 8, height: 7).fill() }
+        func label(_ s: String, _ x: CGFloat, _ y: CGFloat, _ size: CGFloat, _ color: NSColor) {
+            NSAttributedString(string: s, attributes: [.font: roundedFont(size, .heavy), .foregroundColor: color])
+                .draw(at: NSPoint(x: x, y: y))
+        }
+        switch tr {
+        case .dance:                                                      // music notes
+            for i in 0..<2 {
+                let ph = (tt * 0.8 + Double(i) * 0.5).truncatingRemainder(dividingBy: 1)
+                label(i == 0 ? "♪" : "♫", (i == 0 ? -48 : 38) + CGFloat(sin(ph * 6)) * 3, 58 + by + CGFloat(ph) * 30,
+                      12, rgb(0x6E6390, CGFloat(sin(ph * .pi))))
+            }
+        case .scratch:                                                    // scratch marks by its back end
+            if sin(tt * 30) > 0 {
+                rgb(0x8A6F66, 0.85).setFill()
+                NSRect(x: 51, y: 8 + by, width: 3, height: 2).fill()
+                NSRect(x: 53, y: 13 + by, width: 3, height: 2).fill()
+                NSRect(x: 50, y: 18 + by, width: 3, height: 2).fill()
+            }
+        case .coffee:
+            let k = max(0, min(1, min(tt / 0.4, (tr.duration - tt) / 0.4)))
+            guard k > 0.6 else { break }
+            let sipping = (tt > 1.0 && tt < 2.0) || (tt > 2.8 && tt < 3.8)
+            let mx: CGFloat = sipping ? 22 : 27, my: CGFloat = 37 + by + (sipping ? 1 : 0)
+            rgb(0xF4F1EC).setFill()
+            NSRect(x: mx, y: my, width: 8, height: 8).fill()                                  // mug
+            NSRect(x: mx + 8, y: my + 2, width: 2, height: 4).fill()                          // handle
+            rgb(0x6B4226).setFill(); NSRect(x: mx, y: my + 6.5, width: 8, height: 1.5).fill() // coffee
+            for i in 0..<2 {                                                                  // steam
+                let ph = (tt * 0.9 + Double(i) * 0.5).truncatingRemainder(dividingBy: 1)
+                rgb(0xFFFFFF, 0.75 * CGFloat(1 - ph)).setFill()
+                NSRect(x: mx + 2 + CGFloat(i) * 3 + CGFloat(sin(ph * 7)) * 1.5, y: my + 9 + CGFloat(ph) * 12,
+                       width: 2, height: 2).fill()
+            }
+        case .look:
+            if tt > 1.3 && tt < 2.6 { label("?", 30, 64 + by, 14, rgb(0x6E6390)) }
+        case .juggle:
+            let colors = [rgb(0xE85D5D), rgb(0xF2B84B), rgb(0x5B9BE8)]
+            for i in 0..<3 {
+                let p = (tt / 1.1 + Double(i) / 3).truncatingRemainder(dividingBy: 1)
+                guard p < 0.75 else { continue }                         // back in a claw
+                let q = p / 0.75
+                colors[i].setFill()
+                NSRect(x: 40 - 84 * CGFloat(q), y: 44 + by + 46 * CGFloat(sin(q * .pi)), width: 6, height: 6).fill()
+            }
+        case .shades:
+            let drop = CGFloat(max(0, 1 - tt / 0.5)) + CGFloat(max(0, (tt - (tr.duration - 0.5)) / 0.5))
+            let y = eyeY + 1 + 40 * drop
+            rgb(0x141414).setFill()
+            NSRect(x: -30, y: y, width: 18, height: 11).fill()                // left lens
+            NSRect(x: 12, y: y, width: 18, height: 11).fill()                 // right lens
+            NSRect(x: -12, y: y + 7, width: 24, height: 3).fill()             // bridge
+            NSRect(x: -34, y: y + 8, width: 4, height: 2).fill()              // arms of the glasses
+            NSRect(x: 30, y: y + 8, width: 4, height: 2).fill()
+            NSColor.white.setFill()
+            NSRect(x: -27, y: y + 6, width: 4, height: 2).fill()              // glints
+            NSRect(x: 15, y: y + 6, width: 4, height: 2).fill()
+        case .wave, .stretch:
+            break
+        }
     }
 
     func drawHeart(_ c: NSPoint, _ s: CGFloat, _ color: NSColor) {
@@ -728,6 +858,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     var walkTarget: CGFloat?
     var nextWanderAt: Double = 600
     var strollLegsLeft = 0          // a stroll is a few short walks in a row
+    var nextTrickAt: Double = 180
+    var lastTrick: Trick?
+    var trickForced = false         // you asked for it: plays even while working or sleeping
     var prevCount = 0
     var prevDone = 0
     var lastRemind: Double = 0
@@ -761,6 +894,33 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
     var wanderEnabled: Bool { wanderEvery >= 0 }
 
+    /// Seconds between little tricks: -1 = never. Defaults to about every 3 minutes.
+    var trickEvery: Double {
+        get { defaults.object(forKey: "trickEvery") == nil ? 180 : defaults.double(forKey: "trickEvery") }
+        set { defaults.set(newValue, forKey: "trickEvery") }
+    }
+    func trickRest() -> Double { trickEvery <= 0 ? 600 : trickEvery * Double.random(in: 0.7...1.3) }
+
+    func updateTrick(t: Double, mood: Mood) {
+        if let tr = view.trick {
+            if mood != .idle || t - view.trickStart > tr.duration {
+                view.trick = nil; trickForced = false; nextTrickAt = t + trickRest()
+            }
+            return
+        }
+        guard mood == .idle, trickEvery > 0, view.walkDir == 0, walkTarget == nil, t > nextTrickAt else { return }
+        startTrick(nil, t: t)
+    }
+
+    func startTrick(_ which: Trick?, t: Double, forced: Bool = false) {
+        trickForced = forced
+        var pick = which ?? Trick.allCases.randomElement()!
+        if which == nil, pick == lastTrick { pick = Trick.allCases.filter { $0 != lastTrick }.randomElement()! }
+        lastTrick = pick
+        walkTarget = nil; view.walkDir = 0
+        view.trick = pick; view.trickStart = t
+    }
+
     /// How long to rest before the next stroll (±20% so it doesn't feel mechanical).
     func restInterval() -> Double {
         let every = wanderEvery
@@ -787,6 +947,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         home = initialOrigin()
         panel.setFrameOrigin(home)
         nextWanderAt = restInterval()
+        nextTrickAt = trickRest()
         poll()
         panel.orderFrontRegardless()
 
@@ -818,7 +979,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     func wander(t: Double, dt: Double, mood: Mood) {
         let f = panel.frame
         let petRect = NSRect(x: f.minX + 66, y: f.minY + 4, width: 108, height: 100)
-        let free = wanderEnabled && mood == .idle && panel.isVisible && !view.mouseIsDown
+        let free = wanderEnabled && mood == .idle && panel.isVisible && !view.mouseIsDown && view.trick == nil
         guard free, !petRect.contains(NSEvent.mouseLocation) else {
             view.walkDir = 0
             if !free { walkTarget = nil; nextWanderAt = max(nextWanderAt, t + 4) }
@@ -862,6 +1023,12 @@ final class Controller: NSObject, NSApplicationDelegate {
     func poll() {
         let wall = now()
         var list: [Pending] = []
+        let req = baseDir.appendingPathComponent("trick-request")
+        if let name = try? String(contentsOf: req, encoding: .utf8) {
+            try? fm.removeItem(at: req)
+            lastInteraction = wall
+            startTrick(Trick(rawValue: name.trimmingCharacters(in: .whitespacesAndNewlines)), t: lastTick, forced: true)
+        }
         focus.refresh()
         viewing = nil
         if skipViewed, NSWorkspace.shared.frontmostApplication?.bundleIdentifier == claudeDesktopBundleID,
@@ -929,6 +1096,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         else if !dones.isEmpty { mood = .done }
         else if t < happyUntil { mood = .happy }
         else if t < pettedUntil { mood = .petted }
+        else if trickForced && view.trick != nil { mood = .idle }
         else if !busy.isEmpty { mood = .working }
         else if wall - max(lastActivity, lastInteraction) > 300 { mood = .sleepy }
         else { mood = .idle }
@@ -939,6 +1107,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         view.bubble = bubbleLines(mood: mood, pendings: pendings, dones: dones, pettedLine: pettedLine)
         view.t = t
         view.step(dt)
+        updateTrick(t: t, mood: mood)
         wander(t: t, dt: min(dt, 0.1), mood: mood)
 
         let show = !(hideWhenIdle && (mood == .idle || mood == .sleepy || mood == .working))
@@ -1016,6 +1185,20 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
         walk.submenu = walkMenu
         m.addItem(walk)
+        let tricks = NSMenuItem(title: "小动作频率", action: nil, keyEquivalent: "")
+        let trickMenu = NSMenu()
+        trickMenu.autoenablesItems = false
+        let trickChoices: [(String, Double)] = [("经常（约 45 秒）", 45), ("偶尔（约 3 分钟）", 180), ("很少（约 10 分钟）", 600), ("不做", -1)]
+        for (title, secs) in trickChoices {
+            let i = NSMenuItem(title: title, action: #selector(setTrickEvery(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = secs
+            i.state = trickEvery == secs ? .on : .off
+            trickMenu.addItem(i)
+        }
+        tricks.submenu = trickMenu
+        m.addItem(tricks)
+        add("表演一个", #selector(performTrick))
         add("回到屏幕右下角", #selector(resetPosition))
         m.addItem(.separator())
         add("让小 Claude先下班（有请求时会再回来）", #selector(quit))
@@ -1037,6 +1220,15 @@ final class Controller: NSObject, NSApplicationDelegate {
         walkTarget = nil; view.walkDir = 0; strollLegsLeft = 0
         if secs < 0 { panel.setFrameOrigin(home) }
         nextWanderAt = lastTick + (secs == 0 ? 0.5 : restInterval())
+    }
+    @objc func setTrickEvery(_ sender: NSMenuItem) {
+        guard let secs = sender.representedObject as? Double else { return }
+        trickEvery = secs
+        nextTrickAt = lastTick + trickRest()
+    }
+    @objc func performTrick() {
+        lastInteraction = now()
+        startTrick(nil, t: lastTick, forced: true)
     }
     @objc func demoDone() { writeDemoDone(); poll() }
     @objc func demoWork() { writeDemoWork(); poll() }
@@ -1113,6 +1305,34 @@ func renderSnapshot(to path: String) {
     try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
 }
 
+func renderTricks(to path: String) {
+    _ = NSApplication.shared
+    let W: CGFloat = 240, H: CGFloat = 150
+    let shots: [(Trick, Double)] = [(.dance, 0.25), (.scratch, 0.5), (.coffee, 1.4), (.wave, 0.3),
+                                    (.look, 1.8), (.stretch, 1.2), (.juggle, 0.55), (.shades, 1.6)]
+    let n = CGFloat(shots.count)
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(W * n * 2), pixelsHigh: Int(H * 2),
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return }
+    rep.size = NSSize(width: W * n, height: H)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSGradient(starting: rgb(0xD6DEE9), ending: rgb(0xA9BACD))?.draw(in: NSRect(x: 0, y: 0, width: W * n, height: H), angle: -90)
+    let ctx = NSGraphicsContext.current!.cgContext
+    for (i, shot) in shots.enumerated() {
+        let v = PetView(frame: NSRect(x: 0, y: 0, width: W, height: H))
+        v.clearsBackground = false
+        v.mood = .idle; v.trick = shot.0; v.trickStart = 0; v.t = shot.1
+        v.blinkUntil = -1; v.nextBlink = 1e9; v.nextLook = 1e9
+        ctx.saveGState()
+        ctx.translateBy(x: W * CGFloat(i), y: 0)
+        v.draw(v.bounds)
+        ctx.restoreGState()
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+}
+
 // MARK: - main
 
 let args = CommandLine.arguments
@@ -1126,6 +1346,13 @@ if args.count > 1 {
         writeDemoDone(); ensurePetRunning(); exit(0)
     case "demo-work":
         writeDemoWork(); ensurePetRunning(); exit(0)
+    case "trick":
+        try? fm.createDirectory(at: baseDir, withIntermediateDirectories: true)
+        try? (args.count > 2 ? args[2] : "random").write(to: baseDir.appendingPathComponent("trick-request"),
+                                                         atomically: true, encoding: .utf8)
+        ensurePetRunning(); exit(0)
+    case "snapshot-tricks":
+        renderTricks(to: args.count > 2 ? args[2] : "pet-tricks.png"); exit(0)
     case "clear":
         clearAllPending(); exit(0)
     case "status":
