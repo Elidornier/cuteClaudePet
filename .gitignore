@@ -1,0 +1,9 @@
+# build output
+ApprovalPet.app/
+
+# runtime state written by the hooks / pet
+pending/
+events.log
+activity
+
+.DS_Store
