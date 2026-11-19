@@ -4,6 +4,7 @@
 //   ApprovalPet hook          Claude Code hook entry point (reads the hook JSON on stdin)
 //   ApprovalPet demo          fake an approval request for a few seconds
 //   ApprovalPet demo-done     fake a "chat finished" reminder for a few seconds
+//   ApprovalPet demo-work     fake "Claude is working" for a few seconds
 //   ApprovalPet clear         forget every pending request
 //   ApprovalPet status        show which chat the pet thinks you're looking at
 //   ApprovalPet snapshot F    render a preview strip of every mood into PNG file F
@@ -41,6 +42,13 @@ extension Pending {
 
 func now() -> Double { Date().timeIntervalSince1970 }
 
+/// Read one of the pet's switches straight from its settings domain, so the hook
+/// (a plain command-line process) sees exactly what the menu wrote.
+func petPref(_ key: String) -> Bool {
+    CFPreferencesAppSynchronize(petBundleID as CFString)
+    return (CFPreferencesCopyAppValue(key as CFString, petBundleID as CFString) as? Bool) ?? false
+}
+
 func safeName(_ s: String) -> String {
     String(String.UnicodeScalarView(s.unicodeScalars.map {
         (CharacterSet.alphanumerics.contains($0) || $0 == "-") ? $0 : "_"
@@ -75,6 +83,10 @@ func clearSession(_ session: String, keepDone: Bool = false) {
 
 func doneURL(_ session: String) -> URL {
     pendingDir.appendingPathComponent("\(safeName(session))__done.json")
+}
+
+func busyURL(_ session: String) -> URL {
+    pendingDir.appendingPathComponent("\(safeName(session))__busy.json")
 }
 
 func clearAllPending() {
@@ -154,9 +166,12 @@ func runHook() -> Int32 {
     let message = obj["message"] as? String ?? ""
     let app = ProcessInfo.processInfo.environment["__CFBundleIdentifier"]
     let host = ProcessInfo.processInfo.environment["CLAUDE_CODE_HOST_SESSION_ID"]
+    let mode = obj["permission_mode"] as? String ?? ""
+    // you told Claude to go ahead without asking: approval alerts would just be noise
+    let quietApprovals = mode == "bypassPermissions" && !petPref("alertInBypass")
     let slot = slotURL(session: session, agent: agent)
 
-    logLine("\(event) tool=\(tool ?? "-") ntype=\(ntype.isEmpty ? "-" : ntype) agent=\(agent ?? "-") session=\(session.prefix(8)) host=\(host ?? "-") app=\(app ?? "-")")
+    logLine("\(event) tool=\(tool ?? "-") ntype=\(ntype.isEmpty ? "-" : ntype) agent=\(agent ?? "-") session=\(session.prefix(8)) host=\(host ?? "-") mode=\(mode.isEmpty ? "-" : mode) app=\(app ?? "-")")
 
     var raised = false
     func raise(_ kind: String, _ toolName: String?, keepExisting: Bool = false) {
@@ -169,13 +184,23 @@ func runHook() -> Int32 {
         writePending(p, to: slot)
         raised = true
     }
+    // "Claude is working in this chat" — from your message until Stop, refreshed by every tool call
+    func markBusy() {
+        let p = Pending(session: session, agent: nil, kind: "busy", tool: nil, digest: nil, toolUseId: nil,
+                        app: app, project: projectName(obj["cwd"] as? String), time: now(), host: host)
+        writePending(p, to: busyURL(session))
+    }
 
     switch event {
     case "PermissionRequest":
-        raise("permission", tool)
+        if quietApprovals && tool != "AskUserQuestion" && tool != "ExitPlanMode" {
+            logLine("  (bypass mode: no approval alert)")
+        } else {
+            raise("permission", tool)
+        }
     case "Notification":
         if ntype == "permission_prompt" || (ntype.isEmpty && message.lowercased().contains("permission")) {
-            raise("permission", toolFromMessage(message), keepExisting: true)
+            if !quietApprovals { raise("permission", toolFromMessage(message), keepExisting: true) }
         } else if ntype == "elicitation_dialog" {
             raise("question", nil, keepExisting: true)
         }
@@ -190,11 +215,15 @@ func runHook() -> Int32 {
             // A different tool finishing well after the request means Claude moved on (e.g. you said no).
             if same || now() - p.time > 8 { try? fm.removeItem(at: slot) }
         }
+        markBusy()
     case "PermissionDenied":
         try? fm.removeItem(at: slot)
     case "SubagentStop":
         if agent != nil { try? fm.removeItem(at: slot) }
-    case "UserPromptSubmit", "StopFailure":
+    case "UserPromptSubmit":
+        clearSession(session)
+        markBusy()
+    case "StopFailure":
         clearSession(session)
     case "SessionEnd":
         clearSession(session, keepDone: true)
@@ -235,7 +264,7 @@ func roundedFont(_ size: CGFloat, _ w: NSFont.Weight) -> NSFont {
     return f
 }
 
-enum Mood { case idle, sleepy, alert, done, happy, petted }
+enum Mood { case idle, sleepy, alert, done, happy, petted, working }
 
 typealias Line = (text: String, font: NSFont, color: NSColor)
 
@@ -303,7 +332,7 @@ func bubbleLines(mood: Mood, pendings: [Pending], dones: [Pending], pettedLine: 
         return [("谢谢你～ ♪", titleF, ink)]
     case .petted:
         return [(pettedLine, titleF, ink)]
-    case .idle, .sleepy:
+    case .idle, .sleepy, .working:
         return []
     }
 }
@@ -402,7 +431,7 @@ final class PetView: NSView {
                 let c = (since - 2).truncatingRemainder(dividingBy: 5)   // a little hop every 5s
                 if c < 0.45 { hop = CGFloat(sin(c / 0.45 * .pi)) * 7 }
             }
-        case .idle, .sleepy:
+        case .idle, .sleepy, .working:
             break
         }
         hop = hop.rounded()
@@ -452,6 +481,9 @@ final class PetView: NSView {
         case .done:
             if t - doneKick < 2 { let s = sin(t * 14) > 0; armL = s ? 9 : 3; armR = s ? 3 : 9 }   // cheering
             else { bodyLift = sin(t * 2.2) > 0.3 ? 2 : 0 }
+        case .working:                                                    // claws tapping the keyboard
+            let s = sin(t * 20) > 0
+            armL = s ? -13 : -9; armR = s ? -9 : -13
         }
 
         let legTop = rowH
@@ -467,6 +499,10 @@ final class PetView: NSView {
         NSRect(x: -8 * u, y: legTop + rowH + by + armL, width: 2 * u, height: rowH).fill()
         NSRect(x: 6 * u, y: legTop + rowH + by + armR, width: 2 * u, height: rowH).fill()
 
+        if mood == .working {                                             // screen light on its face
+            rgb(0xDDF0FF, 0.22).setFill()
+            NSRect(x: -26, y: 28 + by, width: 52, height: 7).fill()
+        }
         // eyes: row 1, columns 5 and 12
         let eyeMood: Mood = mood == .done ? (t - doneKick < 2 ? .happy : .idle) : mood
         let eyeY = legTop + 2 * rowH + by
@@ -477,6 +513,10 @@ final class PetView: NSView {
             case .idle, .done:
                 eyeInk.setFill()
                 if t < blinkUntil { NSRect(x: ex, y: eyeY + 4.5, width: u, height: 3).fill() } else { r.fill() }
+            case .working:                                                // looking down at the screen
+                eyeInk.setFill()
+                if t < blinkUntil { NSRect(x: ex, y: eyeY + 1, width: u, height: 2.5).fill() }
+                else { NSRect(x: ex, y: eyeY, width: u, height: 8).fill() }
             case .alert:
                 eyeInk.setFill(); r.insetBy(dx: -1, dy: -1).fill()
                 NSColor.white.setFill(); NSRect(x: ex + u - 3, y: eyeY + rowH - 4, width: 2.5, height: 2.5).fill()
@@ -490,7 +530,7 @@ final class PetView: NSView {
                     NSRect(x: x0 + CGFloat(bx) * s, y: y0 + CGFloat(byy) * s, width: s, height: s).fill()
                 }
             }
-            if eyeMood != .idle && eyeMood != .sleepy && eyeMood != .done {
+            if eyeMood != .idle && eyeMood != .sleepy && eyeMood != .done && eyeMood != .working {
                 blushColor.setFill()
                 NSRect(x: i == 0 ? ex - u : ex + u, y: eyeY - 1, width: u, height: 3).fill()
             }
@@ -499,6 +539,18 @@ final class PetView: NSView {
             let o: CGFloat = sin(t * 12) > 0 ? 1 : 0
             mouthRed.setFill(); NSRect(x: -3 - o / 2, y: eyeY + 1, width: 6 + o, height: 4 + o).fill()
         }
+        if mood == .working { drawLaptop() }
+    }
+
+    /// A tiny laptop in front of the crab; we see the back of its lid.
+    func drawLaptop() {
+        rgb(0x8E96A1).setFill(); NSRect(x: -26, y: 6, width: 52, height: 22).fill()      // lid
+        rgb(0xAEB5BE).setFill(); NSRect(x: -26, y: 26, width: 52, height: 2).fill()      // lid edge
+        petColor.setFill()                                                               // little orange plus on the lid
+        NSRect(x: -1.5, y: 12.5, width: 3, height: 9).fill()
+        NSRect(x: -4.5, y: 15.5, width: 9, height: 3).fill()
+        rgb(0xC7CCD3).setFill(); NSRect(x: -34, y: 2, width: 68, height: 5).fill()       // base
+        rgb(0x9AA1AB).setFill(); NSRect(x: -34, y: 2, width: 68, height: 1.5).fill()
     }
 
     func drawHeart(_ c: NSPoint, _ s: CGFloat, _ color: NSColor) {
@@ -546,6 +598,17 @@ final class PetView: NSView {
                     .font: roundedFont(10 + CGFloat(i % 2) * 4, .heavy),
                     .foregroundColor: rgb(0xF2B84B, CGFloat(sin(ph * .pi))),
                 ]).draw(at: NSPoint(x: cx + xs[i], y: ground + hop + 56 + CGFloat(ph) * 30))
+            }
+        case .working:                                                    // bits of code floating up
+            let glyphs = ["{ }", "</>", "01", ";", "( )", "✓"]
+            let xs: [CGFloat] = [-22, 4, 20]
+            for i in 0..<3 {
+                let cyc = t * 0.55 + Double(i) / 3
+                let ph = cyc.truncatingRemainder(dividingBy: 1)
+                NSAttributedString(string: glyphs[(Int(cyc) * 2 + i) % glyphs.count], attributes: [
+                    .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .bold),
+                    .foregroundColor: rgb(0x5B7DB1, 0.9 * CGFloat(sin(ph * .pi))),
+                ]).draw(at: NSPoint(x: cx + xs[i] + CGFloat(sin(cyc * 3)) * 3, y: ground + 62 + CGFloat(ph) * 36))
             }
         case .idle, .alert:
             break
@@ -657,6 +720,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     var lastPoll: Double = 0
     var pendings: [Pending] = []
     var dones: [Pending] = []
+    var busy: [Pending] = []        // chats Claude is working in
     let focus = FocusWatcher()
     var viewing: String?            // desktop chat you're looking at right now (local_…)
     var seen = Set<String>()        // approval requests you already had on screen
@@ -701,6 +765,10 @@ final class Controller: NSObject, NSApplicationDelegate {
     func restInterval() -> Double {
         let every = wanderEvery
         return every <= 0 ? Double.random(in: 3...10) : every * Double.random(in: 0.8...1.2)
+    }
+    var skipInBypass: Bool {
+        get { !defaults.bool(forKey: "alertInBypass") }
+        set { defaults.set(!newValue, forKey: "alertInBypass") }
     }
     var notifyDone: Bool {
         get { !defaults.bool(forKey: "doneOff") }
@@ -809,12 +877,14 @@ final class Controller: NSObject, NSApplicationDelegate {
             let age = wall - p.time
             var stale = age > 4 * 3600 || (p.session.hasPrefix("demo") && age > 8)
                 || (p.kind == "done" && (age > 3600 || !notifyDone))
+                || (p.kind == "busy" && age > 600)
             if !stale, let app = p.app, !app.isEmpty,
                NSWorkspace.shared.urlForApplication(withBundleIdentifier: app) != nil,
                NSRunningApplication.runningApplications(withBundleIdentifier: app).isEmpty {
                 stale = true   // the app hosting that session is gone
             }
             if stale { try? fm.removeItem(at: url); continue }
+            if p.kind == "busy" { list.append(p); continue }
             if let v = viewing, p.host == v {
                 // you're looking at this chat: it finished in front of you, or its prompt is on your screen
                 if p.kind == "done" { try? fm.removeItem(at: url) } else { seen.insert(p.key) }
@@ -823,8 +893,9 @@ final class Controller: NSObject, NSApplicationDelegate {
             list.append(p)
         }
         let sorted = list.sorted { $0.time > $1.time }
-        pendings = sorted.filter { $0.kind != "done" }
+        pendings = sorted.filter { $0.kind != "done" && $0.kind != "busy" }
         dones = sorted.filter { $0.kind == "done" }
+        busy = sorted.filter { $0.kind == "busy" }
         if let d = (try? fm.attributesOfItem(atPath: activityFile.path))?[.modificationDate] as? Date {
             lastActivity = d.timeIntervalSince1970
         }
@@ -862,6 +933,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         else if !dones.isEmpty { mood = .done }
         else if t < happyUntil { mood = .happy }
         else if t < pettedUntil { mood = .petted }
+        else if !busy.isEmpty { mood = .working }
         else if wall - max(lastActivity, lastInteraction) > 300 { mood = .sleepy }
         else { mood = .idle }
         if mood != view.mood {
@@ -873,7 +945,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         view.step(dt)
         wander(t: t, dt: min(dt, 0.1), mood: mood)
 
-        let show = !(hideWhenIdle && (mood == .idle || mood == .sleepy))
+        let show = !(hideWhenIdle && (mood == .idle || mood == .sleepy || mood == .working))
         if show != panel.isVisible {
             if show { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
         }
@@ -928,11 +1000,13 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
         add("试一下：需要批准", #selector(demo))
         add("试一下：对话做完了", #selector(demoDone))
+        add("试一下：陪 Claude 干活", #selector(demoWork))
         if !pendings.isEmpty || !dones.isEmpty { add("清除当前提醒", #selector(clearAll)) }
         m.addItem(.separator())
         add("静音提示音", #selector(toggleMute), on: muted)
         add("对话做完了也提醒我", #selector(toggleDone), on: notifyDone)
         add("正在看的对话就不提醒", #selector(toggleSkipViewed), on: skipViewed)
+        add("bypass 模式下不提醒批准", #selector(toggleSkipInBypass), on: skipInBypass)
         add("平时躲起来，只在需要你时出现", #selector(toggleHide), on: hideWhenIdle)
         let walk = NSMenuItem(title: "溜达频率", action: nil, keyEquivalent: "")
         let walkMenu = NSMenu()
@@ -962,6 +1036,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     @objc func toggleHide() { hideWhenIdle.toggle() }
     @objc func toggleDone() { notifyDone.toggle(); poll() }
     @objc func toggleSkipViewed() { skipViewed.toggle(); poll() }
+    @objc func toggleSkipInBypass() { skipInBypass.toggle() }
     @objc func setWanderEvery(_ sender: NSMenuItem) {
         guard let secs = sender.representedObject as? Double else { return }
         wanderEvery = secs
@@ -970,6 +1045,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         nextWanderAt = lastTick + (secs == 0 ? 0.5 : restInterval())
     }
     @objc func demoDone() { writeDemoDone(); poll() }
+    @objc func demoWork() { writeDemoWork(); poll() }
     @objc func resetPosition() {
         home = defaultOrigin(); walkTarget = nil
         panel.setFrameOrigin(home)
@@ -983,6 +1059,13 @@ func writeDemoDone() {
     let p = Pending(session: "demo-done", agent: nil, kind: "done", tool: nil, digest: nil, toolUseId: nil,
                     app: nil, project: "演示", time: now())
     writePending(p, to: doneURL("demo-done"))
+}
+
+func writeDemoWork() {
+    try? fm.createDirectory(at: pendingDir, withIntermediateDirectories: true)
+    let p = Pending(session: "demo-work", agent: nil, kind: "busy", tool: nil, digest: nil, toolUseId: nil,
+                    app: nil, project: nil, time: now())
+    writePending(p, to: busyURL("demo-work"))
 }
 
 func writeDemo() {
@@ -1008,6 +1091,8 @@ func renderSnapshot(to path: String) {
         (.done, 0.25, bubbleLines(mood: .done, pendings: [], dones: demoDone, pettedLine: "")),
         (.done, 3.0, bubbleLines(mood: .done, pendings: [], dones: demoDone + demoDone, pettedLine: "")),
         (.happy, 0.12, bubbleLines(mood: .happy, pendings: [], dones: [], pettedLine: "")),
+        (.working, 0.30, []),
+        (.working, 1.13, []),
         (.sleepy, 0.9, []),
     ]
     let n = CGFloat(scenes.count)
@@ -1045,6 +1130,8 @@ if args.count > 1 {
         writeDemo(); ensurePetRunning(); exit(0)
     case "demo-done":
         writeDemoDone(); ensurePetRunning(); exit(0)
+    case "demo-work":
+        writeDemoWork(); ensurePetRunning(); exit(0)
     case "clear":
         clearAllPending(); exit(0)
     case "status":
@@ -1052,6 +1139,8 @@ if args.count > 1 {
         print("focused chat:  \(f.focused ?? "-")")
         print("frontmost app: \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-")")
         print("idle seconds:  \(Int(userIdleSeconds()))")
+        print("bypass alerts: \(petPref("alertInBypass") ? "on" : "off (quiet in bypass mode)")")
+        print("muted:         \(petPref("muted"))")
         print("pending:       \(allPending().map { "\($0.1.kind)@\($0.1.host ?? "-")" })")
         exit(0)
     case "snapshot":
