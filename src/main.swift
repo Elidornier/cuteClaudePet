@@ -7,10 +7,13 @@
 //   ApprovalPet demo-work     fake "Claude is working" for a few seconds
 //   ApprovalPet trick [NAME]  do a trick now (dance, scratch, coffee, wave, look, stretch, juggle, shades)
 //   ApprovalPet clear         forget every pending request
+//   ApprovalPet off [MIN]     rest for MIN minutes (no number: until `on`); hooks won't bring it back
+//   ApprovalPet on            wake it up
 //   ApprovalPet status        show which chat the pet thinks you're looking at
 //   ApprovalPet snapshot F    render a preview strip of every mood into PNG file F
 
 import AppKit
+import Carbon
 import Foundation
 
 // MARK: - Shared state on disk
@@ -88,6 +91,67 @@ func doneURL(_ session: String) -> URL {
 
 func busyURL(_ session: String) -> URL {
     pendingDir.appendingPathComponent("\(safeName(session))__busy.json")
+}
+
+// MARK: - Resting (turned off for a while)
+
+let offFile = baseDir.appendingPathComponent("off-until")
+
+/// nil = awake, .infinity = resting until you wake it, otherwise the time (epoch seconds) it wakes up.
+func petOffUntil() -> Double? {
+    guard let s = try? String(contentsOf: offFile, encoding: .utf8) else { return nil }
+    let v = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    if v == "forever" { return .infinity }
+    guard let until = Double(v), until > now() else { try? fm.removeItem(at: offFile); return nil }
+    return until
+}
+
+/// Rest for `minutes` (nil = until woken). Clears current reminders so nothing stale shows up later.
+func setPetOff(minutes: Double?) {
+    try? fm.createDirectory(at: baseDir, withIntermediateDirectories: true)
+    let v = minutes.map { String(now() + $0 * 60) } ?? "forever"
+    try? v.write(to: offFile, atomically: true, encoding: .utf8)
+    clearAllPending()
+}
+
+func setPetOn() { try? fm.removeItem(at: offFile) }
+
+// MARK: - Global shortcut ⌃⌥⌘P: rest until woken / wake up
+// (Carbon hot keys need no Accessibility permission.)
+
+var hotKeyAction: (() -> Void)?
+var hotKeyRef: EventHotKeyRef?
+
+@discardableResult
+func registerRestHotKey(_ action: @escaping () -> Void) -> OSStatus {
+    hotKeyAction = action
+    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+        DispatchQueue.main.async { hotKeyAction?() }
+        return noErr
+    }, 1, &spec, nil, nil)
+    let id = EventHotKeyID(signature: OSType(0x50455421), id: 1)   // 'PET!'
+    return RegisterEventHotKey(UInt32(kVK_ANSI_P), UInt32(cmdKey | optionKey | controlKey), id,
+                               GetApplicationEventTarget(), 0, &hotKeyRef)
+}
+
+/// A small crab silhouette for the menu bar (template image, so it follows light/dark menu bars).
+func crabMenuBarImage() -> NSImage {
+    let img = NSImage(size: NSSize(width: 20, height: 14), flipped: false) { _ in
+        NSColor.black.setFill()
+        let rowH: CGFloat = 2.4
+        func cells(_ col: Int, _ w: Int, _ row: Int) {
+            NSRect(x: 1 + CGFloat(col), y: 1 + CGFloat(4 - row) * rowH, width: CGFloat(w), height: rowH).fill()
+        }
+        cells(3, 12, 0)
+        cells(3, 2, 1); cells(6, 6, 1); cells(13, 2, 1)     // eye holes at columns 5 and 12
+        cells(1, 16, 2)                                      // arms
+        cells(3, 12, 3)
+        for c in [4, 6, 11, 13] { cells(c, 1, 4) }           // legs
+        return true
+    }
+    img.isTemplate = true
+    return img
 }
 
 func clearAllPending() {
@@ -170,12 +234,14 @@ func runHook() -> Int32 {
     let mode = obj["permission_mode"] as? String ?? ""
     // you told Claude to go ahead without asking: approval alerts would just be noise
     let quietApprovals = mode == "bypassPermissions"
+    let resting = petOffUntil() != nil          // turned off for a while: no reminders, don't bring the pet back
     let slot = slotURL(session: session, agent: agent)
 
     logLine("\(event) tool=\(tool ?? "-") ntype=\(ntype.isEmpty ? "-" : ntype) agent=\(agent ?? "-") session=\(session.prefix(8)) host=\(host ?? "-") mode=\(mode.isEmpty ? "-" : mode) app=\(app ?? "-")")
 
     var raised = false
     func raise(_ kind: String, _ toolName: String?, keepExisting: Bool = false) {
+        if resting { return }
         if keepExisting && fm.fileExists(atPath: slot.path) { return }
         var k = kind
         if toolName == "AskUserQuestion" { k = "question" } else if toolName == "ExitPlanMode" { k = "plan" }
@@ -187,6 +253,7 @@ func runHook() -> Int32 {
     }
     // "Claude is working in this chat" — from your message until Stop, refreshed by every tool call
     func markBusy() {
+        if resting { return }
         let p = Pending(session: session, agent: nil, kind: "busy", tool: nil, digest: nil, toolUseId: nil,
                         app: app, project: projectName(obj["cwd"] as? String), time: now(), host: host)
         writePending(p, to: busyURL(session))
@@ -233,13 +300,12 @@ func runHook() -> Int32 {
         clearSession(session)
         let p = Pending(session: session, agent: nil, kind: "done", tool: nil, digest: nil, toolUseId: nil,
                         app: app, project: projectName(obj["cwd"] as? String), time: now(), host: host)
-        writePending(p, to: doneURL(session))
-        raised = true
+        if !resting { writePending(p, to: doneURL(session)); raised = true }
     default:
         break
     }
 
-    if raised || event == "SessionStart" { ensurePetRunning() }
+    if !resting && (raised || event == "SessionStart") { ensurePetRunning() }
     return 0
 }
 
@@ -841,7 +907,7 @@ func userIdleSeconds() -> Double {
 
 // MARK: - App controller
 
-final class Controller: NSObject, NSApplicationDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var panel: PetPanel!
     let view = PetView(frame: NSRect(x: 0, y: 0, width: 240, height: 234))
     var timer: Timer?
@@ -860,6 +926,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     var strollLegsLeft = 0          // a stroll is a few short walks in a row
     var nextTrickAt: Double = 180
     var lastTrick: Trick?
+    var statusItem: NSStatusItem?    // menu-bar crab, only while resting
+    var restHeader: NSMenuItem?
+    var resting = false
     var trickForced = false         // you asked for it: plays even while working or sleeping
     var prevCount = 0
     var prevDone = 0
@@ -949,7 +1018,10 @@ final class Controller: NSObject, NSApplicationDelegate {
         nextWanderAt = restInterval()
         nextTrickAt = trickRest()
         poll()
-        panel.orderFrontRegardless()
+        if !resting { panel.orderFrontRegardless() }
+
+        let hk = registerRestHotKey { [weak self] in self?.toggleRest() }
+        logLine("pet started; rest shortcut ⌃⌥⌘P \(hk == noErr ? "registered" : "failed (\(hk))")")
 
         let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer, forMode: .common)
@@ -966,6 +1038,75 @@ final class Controller: NSObject, NSApplicationDelegate {
         let p = NSPoint(x: defaults.double(forKey: "x"), y: defaults.double(forKey: "y"))
         let petSpot = NSPoint(x: p.x + view.frame.width / 2, y: p.y + 50)
         return NSScreen.screens.contains { $0.frame.contains(petSpot) } ? p : defaultOrigin()
+    }
+
+    // MARK: resting
+
+    func enterRest() {
+        resting = true
+        view.trick = nil; trickForced = false; walkTarget = nil; view.walkDir = 0
+        pendings = []; dones = []; busy = []; prevCount = 0; prevDone = 0
+        panel.orderOut(nil)
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = crabMenuBarImage()
+        item.button?.toolTip = "小 Claude 在休息"
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        let header = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        menu.addItem(.separator())
+        let wake = NSMenuItem(title: "现在叫醒小 Claude", action: #selector(wakeUp), keyEquivalent: "p")
+        wake.keyEquivalentModifierMask = [.control, .option, .command]
+        wake.target = self
+        menu.addItem(wake)
+        item.menu = menu
+        statusItem = item
+        restHeader = header
+        updateRestHeader()
+    }
+
+    func updateRestHeader() {
+        guard let until = petOffUntil() else { restHeader?.title = "小 Claude 醒啦"; return }
+        if until == .infinity { restHeader?.title = "小 Claude 在休息，等你叫醒它"; return }
+        let mins = max(1, Int(ceil((until - now()) / 60)))
+        restHeader?.title = mins >= 60 ? "小 Claude 在休息 · 还有 \(mins / 60) 小时 \(mins % 60) 分钟"
+                                       : "小 Claude 在休息 · 还有 \(mins) 分钟"
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        if menu === statusItem?.menu { updateRestHeader() }
+    }
+
+    func leaveRest() {
+        resting = false
+        if let s = statusItem { NSStatusBar.system.removeStatusItem(s) }
+        statusItem = nil; restHeader = nil
+        lastInteraction = now()
+        nextWanderAt = lastTick + restInterval()
+        nextTrickAt = lastTick + trickRest()
+        pettedLine = "我回来啦～"
+        pettedUntil = lastTick + 2.0
+        panel.orderFrontRegardless()
+    }
+
+    @objc func wakeUp() { setPetOn(); poll() }
+
+    @objc func toggleRest() {
+        if resting { wakeUp() } else { setPetOff(minutes: nil); poll() }
+    }
+
+    @objc func restFor(_ sender: NSMenuItem) {
+        guard let mins = sender.representedObject as? Double else { return }
+        setPetOff(minutes: mins < 0 ? nil : mins)
+        poll()
+    }
+
+    /// Opening the app again (Spotlight, Finder, `open`) wakes it up.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if resting { wakeUp() }
+        return false
     }
 
     func savePosition() {
@@ -1023,6 +1164,9 @@ final class Controller: NSObject, NSApplicationDelegate {
     func poll() {
         let wall = now()
         var list: [Pending] = []
+        let off = petOffUntil()
+        if off != nil && !resting { enterRest() } else if off == nil && resting { leaveRest() }
+        if resting { return }
         let req = baseDir.appendingPathComponent("trick-request")
         if let name = try? String(contentsOf: req, encoding: .utf8) {
             try? fm.removeItem(at: req)
@@ -1070,6 +1214,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         lastTick = t
         let wall = now()
         if wall - lastPoll > 0.4 { poll(); lastPoll = wall }
+        if resting { return }
 
         let count = pendings.count
         if count > prevCount {
@@ -1201,6 +1346,19 @@ final class Controller: NSObject, NSApplicationDelegate {
         add("表演一个", #selector(performTrick))
         add("回到屏幕右下角", #selector(resetPosition))
         m.addItem(.separator())
+        let rest = NSMenuItem(title: "休息一会儿", action: nil, keyEquivalent: "")
+        let restMenu = NSMenu()
+        restMenu.autoenablesItems = false
+        let restChoices: [(String, Double)] = [("30 分钟", 30), ("1 小时", 60), ("2 小时", 120), ("4 小时", 240), ("直到我叫醒它", -1)]
+        for (title, mins) in restChoices {
+            let i = NSMenuItem(title: title, action: #selector(restFor(_:)), keyEquivalent: mins < 0 ? "p" : "")
+            if mins < 0 { i.keyEquivalentModifierMask = [.control, .option, .command] }
+            i.target = self
+            i.representedObject = mins
+            restMenu.addItem(i)
+        }
+        rest.submenu = restMenu
+        m.addItem(rest)
         add("让小 Claude先下班（有请求时会再回来）", #selector(quit))
         return m
     }
@@ -1355,12 +1513,22 @@ if args.count > 1 {
         renderTricks(to: args.count > 2 ? args[2] : "pet-tricks.png"); exit(0)
     case "clear":
         clearAllPending(); exit(0)
+    case "off":
+        let mins = args.count > 2 ? Double(args[2]) : nil
+        setPetOff(minutes: mins)
+        print(mins.map { "小 Claude 休息 \($0) 分钟（ApprovalPet on 可以提前叫醒）" } ?? "小 Claude 休息中，运行 ApprovalPet on 叫醒它")
+        exit(0)
+    case "on":
+        setPetOn(); ensurePetRunning()
+        print("小 Claude 醒啦"); exit(0)
     case "status":
         let f = FocusWatcher(); f.refresh()
         print("focused chat:  \(f.focused ?? "-")")
         print("frontmost app: \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-")")
         print("idle seconds:  \(Int(userIdleSeconds()))")
         print("muted:         \(petPref("muted"))")
+        let off = petOffUntil()
+        print("resting:       \(off == nil ? "no" : (off == .infinity ? "until woken" : "\(Int((off! - now()) / 60)) more min"))")
         print("pending:       \(allPending().map { "\($0.1.kind)@\($0.1.host ?? "-")" })")
         exit(0)
     case "snapshot":
