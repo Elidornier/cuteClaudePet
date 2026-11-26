@@ -437,6 +437,7 @@ final class PetView: NSView {
     var bubble: [Line] = []
     var bubbleStart: Double = 0
     var clearsBackground = true
+    var hiddenPet = false           // resting / hidden: draw nothing at all
     var walkDir = 0                 // -1 left, 0 standing, 1 right
     var mouseIsDown = false
     var trick: Trick?
@@ -455,6 +456,35 @@ final class PetView: NSView {
 
     override var isFlipped: Bool { false }
     override var isOpaque: Bool { false }
+
+    // Render each frame on the CPU into a plain image and hand it to the layer. The default
+    // GPU-accelerated drawing path can block the main thread for seconds when macOS gives a
+    // background app's GPU work low priority — which made the pet miss rest/wake changes.
+    private var frameCtx: CGContext?
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        guard let layer else { return }
+        let scale = window?.backingScaleFactor ?? 2
+        let w = Int(bounds.width * scale), h = Int(bounds.height * scale)
+        // draw straight in the screen's color space and native BGRA layout, so nothing gets converted per frame
+        let space = window?.colorSpace?.cgColorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        if frameCtx == nil || frameCtx!.width != w || frameCtx!.height != h || frameCtx!.colorSpace != space {
+            frameCtx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        }
+        guard let ctx = frameCtx else { return }
+        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.saveGState()
+        ctx.scaleBy(x: scale, y: scale)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        draw(bounds)
+        NSGraphicsContext.restoreGraphicsState()
+        ctx.restoreGState()
+        layer.drawsAsynchronously = false
+        layer.contentsScale = scale
+        layer.contents = ctx.makeImage()
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     func step(_ dt: Double) {
@@ -499,6 +529,7 @@ final class PetView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         if clearsBackground { NSColor.clear.set(); bounds.fill(using: .copy) }
+        if hiddenPet { return }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let cx = bounds.midX
         let ground: CGFloat = 18
@@ -927,6 +958,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var nextTrickAt: Double = 180
     var lastTrick: Trick?
     var statusItem: NSStatusItem?    // menu-bar crab, only while resting
+    var activity: NSObjectProtocol?  // keeps macOS from napping the pet while it's hidden
+    var lastVisCheck: Double = 0
+    var petShown = true
     var restHeader: NSMenuItem?
     var resting = false
     var trickForced = false         // you asked for it: plays even while working or sleeping
@@ -1012,18 +1046,27 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.becomesKeyOnlyIfNeeded = true
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         view.controller = self
+        view.wantsLayer = true
+        view.layerContentsRedrawPolicy = .onSetNeedsDisplay
         panel.contentView = view
         home = initialOrigin()
         panel.setFrameOrigin(home)
         nextWanderAt = restInterval()
         nextTrickAt = trickRest()
+        panel.orderFrontRegardless()
         poll()
-        if !resting { panel.orderFrontRegardless() }
 
+        // App Nap would slow the pet's timers to a crawl while it's in the background, delaying wake-ups.
+        defaults.set(true, forKey: "NSAppSleepDisabled")
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
+                                                          reason: "desktop pet reminders")
+        // Monitors plugged in / unplugged: make sure the pet still stands on a screen.
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in self?.keepOnScreen() }
         let hk = registerRestHotKey { [weak self] in self?.toggleRest() }
         logLine("pet started; rest shortcut ⌃⌥⌘P \(hk == noErr ? "registered" : "failed (\(hk))")")
 
-        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.tick() }
+        let timer = Timer(timeInterval: 1.0 / 15, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
     }
@@ -1046,7 +1089,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         resting = true
         view.trick = nil; trickForced = false; walkTarget = nil; view.walkDir = 0
         pendings = []; dones = []; busy = []; prevCount = 0; prevDone = 0
-        panel.orderOut(nil)
+        setShown(false)
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = crabMenuBarImage()
         item.button?.toolTip = "小 Claude 在休息"
@@ -1088,7 +1131,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         nextTrickAt = lastTick + trickRest()
         pettedLine = "我回来啦～"
         pettedUntil = lastTick + 2.0
-        panel.orderFrontRegardless()
+        setShown(true)
     }
 
     @objc func wakeUp() { setPetOn(); poll() }
@@ -1109,6 +1152,29 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return false
     }
 
+    /// Show / hide the pet. The window itself never moves or leaves the screen (macOS doesn't reliably
+    /// bring a hidden background panel back); a hidden pet just draws nothing, so the window is fully
+    /// transparent and clicks go straight through it.
+    func setShown(_ v: Bool) {
+        guard v != petShown else { return }
+        petShown = v
+        logLine("pet: \(v ? "shown" : "hidden")")
+        view.hiddenPet = !v
+        view.needsDisplay = true
+        if v { keepOnScreen() }
+    }
+
+    /// If the pet's spot isn't on any connected screen any more, move it home to the default corner.
+    func keepOnScreen() {
+        let f = panel.frame
+        let spot = NSPoint(x: f.midX, y: f.minY + 50)
+        if !NSScreen.screens.contains(where: { $0.frame.contains(spot) }) {
+            walkTarget = nil; view.walkDir = 0
+            home = defaultOrigin()
+            panel.setFrameOrigin(home)
+        }
+    }
+
     func savePosition() {
         defaults.set(Double(panel.frame.origin.x), forKey: "x")
         defaults.set(Double(panel.frame.origin.y), forKey: "y")
@@ -1120,7 +1186,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func wander(t: Double, dt: Double, mood: Mood) {
         let f = panel.frame
         let petRect = NSRect(x: f.minX + 66, y: f.minY + 4, width: 108, height: 100)
-        let free = wanderEnabled && mood == .idle && panel.isVisible && !view.mouseIsDown && view.trick == nil
+        let free = wanderEnabled && mood == .idle && petShown && !view.mouseIsDown && view.trick == nil
         guard free, !petRect.contains(NSEvent.mouseLocation) else {
             view.walkDir = 0
             if !free { walkTarget = nil; nextWanderAt = max(nextWanderAt, t + 4) }
@@ -1256,10 +1322,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wander(t: t, dt: min(dt, 0.1), mood: mood)
 
         let show = !(hideWhenIdle && (mood == .idle || mood == .sleepy || mood == .working))
-        if show != panel.isVisible {
-            if show { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
+        setShown(show)
+        if petShown { view.needsDisplay = true }
+        // self-heal: the window should always be up and on a screen (it never hides itself)
+        if wall - lastVisCheck > 2 {
+            lastVisCheck = wall
+            if !panel.isVisible || !NSScreen.screens.contains(where: { $0.frame.intersects(panel.frame) }) {
+                keepOnScreen()
+                panel.orderFrontRegardless()
+            }
         }
-        if panel.isVisible { view.needsDisplay = true }
     }
 
     func petClicked() {
